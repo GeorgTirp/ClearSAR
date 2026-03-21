@@ -1,7 +1,50 @@
 import inspect
-from typing import Iterable, Sequence
+from typing import Any, Dict, Iterable, List, Sequence
 
 import torch
+
+
+class MultiOptimizer:
+    """
+    Simple wrapper that steps multiple optimizers together.
+    """
+
+    def __init__(self, optimizers: Sequence[torch.optim.Optimizer]) -> None:
+        self.optimizers = [opt for opt in optimizers if opt is not None]
+        if not self.optimizers:
+            raise ValueError("MultiOptimizer requires at least one optimizer.")
+        self.param_groups = []
+        for optimizer in self.optimizers:
+            self.param_groups.extend(optimizer.param_groups)
+
+    def zero_grad(self, set_to_none: bool = False) -> None:
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(set_to_none=set_to_none)
+
+    def step(self, closure=None):
+        loss = None
+        for idx, optimizer in enumerate(self.optimizers):
+            if closure is not None and idx == 0:
+                loss = optimizer.step(closure)
+            else:
+                optimizer.step()
+        return loss
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "type": "multi_optimizer",
+            "optimizers": [optimizer.state_dict() for optimizer in self.optimizers],
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        optimizer_states = state_dict.get("optimizers", [])
+        if len(optimizer_states) != len(self.optimizers):
+            raise ValueError(
+                "Mismatched number of optimizers in state_dict: "
+                f"expected {len(self.optimizers)}, got {len(optimizer_states)}"
+            )
+        for optimizer, optimizer_state in zip(self.optimizers, optimizer_states):
+            optimizer.load_state_dict(optimizer_state)
 
 
 def _resolve_soap_class():
@@ -22,6 +65,50 @@ def _resolve_soap_class():
         "Install Emerging-Optimizers first (see NVIDIA docs). "
         f"Import errors: {joined}"
     )
+
+
+def _normalize_param_groups(
+    params: Iterable[torch.nn.Parameter] | Iterable[dict],
+    lr: float,
+) -> List[Dict[str, Any]]:
+    params = list(params)
+    if not params:
+        return []
+
+    first = params[0]
+    if isinstance(first, dict):
+        groups: List[Dict[str, Any]] = []
+        for group in params:
+            copied = dict(group)
+            copied["params"] = list(copied.get("params", []))
+            groups.append(copied)
+        return groups
+
+    return [{"params": list(params), "lr": lr}]
+
+
+def _split_matrix_param_groups(
+    param_groups: Sequence[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    matrix_groups: List[Dict[str, Any]] = []
+    other_groups: List[Dict[str, Any]] = []
+
+    for group in param_groups:
+        base = {k: v for k, v in group.items() if k != "params"}
+        group_params = list(group.get("params", []))
+        matrix_params = [p for p in group_params if isinstance(p, torch.nn.Parameter) and p.ndim == 2]
+        non_matrix_params = [p for p in group_params if isinstance(p, torch.nn.Parameter) and p.ndim != 2]
+
+        if matrix_params:
+            matrix_group = dict(base)
+            matrix_group["params"] = matrix_params
+            matrix_groups.append(matrix_group)
+        if non_matrix_params:
+            other_group = dict(base)
+            other_group["params"] = non_matrix_params
+            other_groups.append(other_group)
+
+    return matrix_groups, other_groups
 
 
 def build_kl_shampoo_optimizer(
@@ -45,13 +132,19 @@ def build_kl_shampoo_optimizer(
     max_update_rms: float = 0.0,
     use_kl_shampoo: bool = True,
     correct_shampoo_beta_bias: bool | None = None,
-) -> torch.optim.Optimizer:
+    matrix_only: bool = True,
+) -> torch.optim.Optimizer | MultiOptimizer:
     """
     Build NVIDIA SOAP optimizer configured for KL-Shampoo.
     """
-    SOAP = _resolve_soap_class()
-    signature = inspect.signature(SOAP.__init__)
-    supported = set(signature.parameters.keys())
+    param_groups = _normalize_param_groups(params, lr)
+    if not param_groups:
+        raise ValueError("No parameters provided to build_kl_shampoo_optimizer.")
+
+    matrix_groups = param_groups
+    other_groups: List[Dict[str, Any]] = []
+    if matrix_only:
+        matrix_groups, other_groups = _split_matrix_param_groups(param_groups)
 
     kwargs = {
         "lr": lr,
@@ -74,11 +167,35 @@ def build_kl_shampoo_optimizer(
         "correct_shampoo_beta_bias": correct_shampoo_beta_bias,
     }
 
-    # API compatibility across package versions.
-    if "nesterov" in supported:
-        kwargs["nesterov"] = nesterov
-    if "use_nesterov" in supported:
-        kwargs["use_nesterov"] = nesterov
+    optimizers: List[torch.optim.Optimizer] = []
 
-    filtered = {k: v for k, v in kwargs.items() if k in supported}
-    return SOAP(params, **filtered)
+    if matrix_groups:
+        SOAP = _resolve_soap_class()
+        signature = inspect.signature(SOAP.__init__)
+        supported = set(signature.parameters.keys())
+
+        # API compatibility across package versions.
+        if "nesterov" in supported:
+            kwargs["nesterov"] = nesterov
+        if "use_nesterov" in supported:
+            kwargs["use_nesterov"] = nesterov
+
+        filtered = {k: v for k, v in kwargs.items() if k in supported}
+        optimizers.append(SOAP(matrix_groups, **filtered))
+
+    if other_groups:
+        optimizers.append(
+            torch.optim.AdamW(
+                other_groups,
+                lr=lr,
+                betas=tuple(betas),
+                eps=eps,
+                weight_decay=weight_decay,
+            )
+        )
+
+    if not optimizers:
+        raise ValueError("No optimizer could be constructed from the provided parameter groups.")
+    if len(optimizers) == 1:
+        return optimizers[0]
+    return MultiOptimizer(optimizers)

@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.model import SummitDINOModel
-from src.optim import build_kl_shampoo_optimizer
+from src.optim import MultiOptimizer, build_kl_shampoo_optimizer
 
 
 PATH_CONFIG_KEYS = {
@@ -29,6 +29,9 @@ PATH_CONFIG_KEYS = {
     "images_root",
     "output_dir",
 }
+
+
+OptimizerLike = torch.optim.Optimizer | MultiOptimizer
 
 
 def load_config_file(config_path: Optional[Path]) -> Dict[str, Any]:
@@ -562,7 +565,7 @@ def build_optimizer(
     backbone_lr_mult: float,
     weight_decay: float,
     soap_args: Dict[str, Any],
-) -> torch.optim.Optimizer:
+) -> OptimizerLike:
     backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
     other_params = [
         p for name, p in model.named_parameters() if not name.startswith("backbone.") and p.requires_grad
@@ -600,8 +603,15 @@ def build_optimizer(
             max_update_rms=soap_args["max_update_rms"],
             use_kl_shampoo=soap_args["use_kl_shampoo"],
             correct_shampoo_beta_bias=soap_args["correct_shampoo_beta_bias"],
+            matrix_only=True,
         )
     raise ValueError(f"Unknown optimizer '{optimizer_name}'.")
+
+
+def build_schedulers(optimizer: OptimizerLike, t_max: int) -> List[torch.optim.lr_scheduler.LRScheduler]:
+    if isinstance(optimizer, MultiOptimizer):
+        return [torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=t_max) for opt in optimizer.optimizers]
+    return [torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max)]
 
 
 def set_backbone_trainable(model: SummitDINOModel, trainable: bool) -> None:
@@ -613,7 +623,7 @@ def run_epoch(
     model: SummitDINOModel,
     criterion: DetectionCriterion,
     data_loader: DataLoader,
-    optimizer: Optional[torch.optim.Optimizer],
+    optimizer: Optional[OptimizerLike],
     device: torch.device,
     weight_dict: Dict[str, float],
     print_freq: int,
@@ -668,7 +678,7 @@ def save_checkpoint(
     epoch_in_phase: int,
     global_epoch: int,
     model: SummitDINOModel,
-    optimizer: torch.optim.Optimizer,
+    optimizer: OptimizerLike,
     train_loss: float,
     val_loss: float,
     args_dict: Dict[str, object],
@@ -836,7 +846,7 @@ def main() -> None:
             weight_decay=args.weight_decay,
             soap_args=soap_args,
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=phase_epochs)
+        schedulers = build_schedulers(optimizer, t_max=phase_epochs)
 
         print(
             f"\n=== {phase_name} | epochs={phase_epochs} | "
@@ -868,7 +878,8 @@ def main() -> None:
                     print_freq=args.print_freq,
                     grad_clip_norm=args.grad_clip_norm,
                 )
-            scheduler.step()
+            for scheduler in schedulers:
+                scheduler.step()
 
             ckpt_path = save_checkpoint(
                 output_dir=args.output_dir,
