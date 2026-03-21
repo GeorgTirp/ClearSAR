@@ -1,3 +1,5 @@
 src/data/
 checkpoints/summit/
 checkpoints/summit/checkpoint.pth
+wandb/
+job_outputs/

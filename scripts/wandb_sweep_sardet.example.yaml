@@ -1,0 +1,35 @@
+program: scripts/train_sardet.py
+name: clearsar_sardet_sweep
+method: bayes
+metric:
+  name: val/loss
+  goal: minimize
+
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 5e-06
+    max: 0.0003
+  batch_size:
+    values: [4, 8]
+  backbone_lr_mult:
+    values: [0.05, 0.1, 0.2]
+  phase_a_epochs:
+    values: [2, 3, 5]
+  optimizer:
+    values: ["adamw", "kl_shampoo"]
+  soap_shampoo_beta:
+    values: [0.9, 0.95, 0.98]
+
+command:
+  - ${env}
+  - python3
+  - ${program}
+  - --config
+  - scripts/train_sardet_config.example.json
+  - --wandb-enable
+  - --wandb-use-sweep-config
+  - --wandb-project
+  - clearsar-sardet
+  - --wandb-entity
+  - geotir-university-of-t-bingen

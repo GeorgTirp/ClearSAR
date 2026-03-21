@@ -153,6 +153,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--print-freq", type=int, default=20)
+    parser.add_argument("--wandb-enable", action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument("--wandb-project", type=str, default="clearsar-sardet")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-group", type=str, default=None)
+    parser.add_argument("--wandb-job-type", type=str, default="train")
+    parser.add_argument("--wandb-tags", type=str, nargs="*", default=None)
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        default="online",
+        choices=["online", "offline", "disabled"],
+    )
+    parser.add_argument(
+        "--wandb-use-sweep-config",
+        action="store_true",
+        help="Apply matching keys from wandb.config to training args (for sweeps).",
+    )
+    parser.add_argument("--wandb-watch", action="store_true", help="Enable gradient/parameter watching.")
+    parser.add_argument("--wandb-log-freq", type=int, default=100)
 
     return parser
 
@@ -169,10 +189,7 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"Unknown config keys: {unknown}")
         parser.set_defaults(**config_values)
 
-    args = parser.parse_args()
-    if args.summit_checkpoint is None:
-        parser.error("--summit-checkpoint is required (provide via CLI or config).")
-    return args
+    return parser.parse_args()
 
 
 def set_seed(seed: int) -> None:
@@ -709,8 +726,79 @@ def serialize_args(args: argparse.Namespace) -> Dict[str, object]:
     return out
 
 
+def _coerce_wandb_value(key: str, current_value: Any, new_value: Any) -> Any:
+    if key in PATH_CONFIG_KEYS and new_value is not None:
+        return Path(new_value)
+    if isinstance(current_value, Path) and new_value is not None:
+        return Path(new_value)
+    if key == "soap_betas" and isinstance(new_value, (list, tuple)):
+        return tuple(float(v) for v in new_value)
+    if isinstance(current_value, tuple) and isinstance(new_value, (list, tuple)):
+        return tuple(new_value)
+    return new_value
+
+
+def apply_wandb_sweep_config(args: argparse.Namespace, wandb_config: Dict[str, Any]) -> Dict[str, Any]:
+    overrides: Dict[str, Any] = {}
+    for key, value in dict(wandb_config).items():
+        if not hasattr(args, key):
+            continue
+        current = getattr(args, key)
+        coerced = _coerce_wandb_value(key, current, value)
+        setattr(args, key, coerced)
+        overrides[key] = coerced
+    return overrides
+
+
+def maybe_init_wandb(args: argparse.Namespace) -> tuple[Any, Dict[str, Any]]:
+    if not args.wandb_enable or args.wandb_mode == "disabled":
+        return None, {}
+
+    try:
+        import wandb  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            "wandb is not installed. Install it with `pip install wandb` "
+            "or add wandb to your project dependencies."
+        ) from exc
+
+    init_kwargs = {
+        "project": args.wandb_project,
+        "entity": args.wandb_entity,
+        "name": args.wandb_run_name,
+        "group": args.wandb_group,
+        "job_type": args.wandb_job_type,
+        "tags": args.wandb_tags,
+        "mode": args.wandb_mode,
+        "config": serialize_args(args),
+    }
+    init_kwargs = {k: v for k, v in init_kwargs.items() if v is not None}
+
+    run = wandb.init(**init_kwargs)
+    sweep_overrides: Dict[str, Any] = {}
+    if args.wandb_use_sweep_config:
+        sweep_overrides = apply_wandb_sweep_config(args, dict(run.config))
+        if sweep_overrides:
+            keys = ", ".join(sorted(sweep_overrides.keys()))
+            print(f"Applied W&B sweep overrides for keys: {keys}")
+    return run, sweep_overrides
+
+
+def collect_lr_metrics(optimizer: OptimizerLike) -> Dict[str, float]:
+    metrics: Dict[str, float] = {}
+    if isinstance(optimizer, MultiOptimizer):
+        for opt_idx, opt in enumerate(optimizer.optimizers):
+            for group_idx, group in enumerate(opt.param_groups):
+                metrics[f"lr/opt{opt_idx}_group{group_idx}"] = float(group["lr"])
+    else:
+        for group_idx, group in enumerate(optimizer.param_groups):
+            metrics[f"lr/group{group_idx}"] = float(group["lr"])
+    return metrics
+
+
 def main() -> None:
     args = parse_args()
+    wandb_run, _ = maybe_init_wandb(args)
     set_seed(args.seed)
 
     if args.train_ann is None:
@@ -719,6 +807,8 @@ def main() -> None:
         args.val_ann = args.data_root / "annotations" / "val.json"
     if args.images_root is None:
         args.images_root = args.data_root / "images"
+    if args.summit_checkpoint is None:
+        raise ValueError("--summit-checkpoint is required (provide via CLI, config, or sweep override).")
 
     if args.num_classes is None:
         args.num_classes = infer_num_classes(args.train_ann)
@@ -777,6 +867,10 @@ def main() -> None:
         include_no_object=args.include_no_object,
         freeze_backbone=False,
     ).to(device)
+    if wandb_run is not None:
+        wandb_run.config.update(serialize_args(args), allow_val_change=True)
+        if args.wandb_watch:
+            wandb_run.watch(model, log="all", log_freq=args.wandb_log_freq)
 
     matcher = HungarianMatcher(
         cost_class=args.cls_loss_coef,
@@ -908,6 +1002,24 @@ def main() -> None:
                     best_path,
                 )
                 print(f"New best checkpoint: {best_path} (val_loss={best_val:.4f})")
+                if wandb_run is not None:
+                    wandb_run.summary["best_val_loss"] = float(best_val)
+                    wandb_run.summary["best_checkpoint"] = str(best_path)
+
+            if wandb_run is not None:
+                metrics = {
+                    "epoch": global_epoch,
+                    "phase/name": phase_name,
+                    "phase/epoch": epoch,
+                    "train/loss": float(train_loss),
+                    "val/loss": float(val_loss),
+                    "val/best_loss": float(best_val),
+                }
+                metrics.update(collect_lr_metrics(optimizer))
+                wandb_run.log(metrics, step=global_epoch)
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

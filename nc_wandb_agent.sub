@@ -1,0 +1,28 @@
+universe   = vanilla
+initialdir = /home/georg/Documents/ESA/ClearSAR
+
+executable = nc_wandb_agent.sh
+arguments  = geotir-university-of-t-bingen/clearsar-sardet/<sweep_id> 1
+
+output = job_outputs/agent.$(Cluster).$(Process).out
+error  = job_outputs/agent.$(Cluster).$(Process).err
+log    = job_outputs/agent.$(Cluster).log
+
+request_cpus   = 4
+request_memory = 12288
+request_gpus   = 1
+
+getenv = True
+
+# IMPORTANT: ensure WANDB_API_KEY is available on the execute node.
+# Option A: export WANDB_API_KEY in the submit shell before condor_submit.
+# Option B: set it explicitly here if your cluster policy allows it.
+
++JobBatchName = "clearsar-wandb-sweep"
+
+MaxTime = 345600
+
+periodic_hold = (JobStatus == 2) && ((CurrentTime - JobCurrentStartDate) >= $(MaxTime))
+periodic_hold_reason = "Job runtime exceeded MaxTime"
+
+queue 1
