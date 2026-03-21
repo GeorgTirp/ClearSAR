@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "clearsar"
+version = "0.1.0"
+description = "ClearSAR training code for SUMMIT backbone + Deformable DINO detector."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "pillow>=10.0",
+  "torch>=2.1",
+  "torchvision>=0.16",
+  "timm>=1.0.25",
+]
+
+[project.optional-dependencies]
+kl-shampoo = [
+  "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git",
+]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
