@@ -32,6 +32,7 @@ PATH_CONFIG_KEYS = {
     "images_root",
     "test_images_root",
     "output_dir",
+    "resume_checkpoint",
 }
 
 
@@ -47,12 +48,24 @@ def load_config_file(config_path: Optional[Path]) -> Dict[str, Any]:
         return {}
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
-    if config_path.suffix.lower() != ".json":
-        raise ValueError(f"Only JSON config is supported, got: {config_path}")
+    suffix = config_path.suffix.lower()
+    if suffix == ".json":
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    elif suffix in {".yaml", ".yml"}:
+        try:
+            import yaml
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "YAML config requires PyYAML. Install it with `pip install pyyaml`."
+            ) from exc
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        if payload is None:
+            payload = {}
+    else:
+        raise ValueError(f"Only JSON or YAML config is supported, got: {config_path}")
 
-    payload = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
-        raise ValueError(f"Config must be a JSON object, got: {type(payload).__name__}")
+        raise ValueError(f"Config must be a JSON/YAML object, got: {type(payload).__name__}")
 
     normalized: Dict[str, Any] = {}
     for key, value in payload.items():
@@ -125,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=None,
-        help="Path to JSON config file. CLI args override config values.",
+        help="Path to JSON or YAML config file. CLI args override config values.",
     )
 
     parser.add_argument("--data-root", type=Path, default=Path("src/data/ClearSAR/data"))
@@ -163,6 +176,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Optional local checkpoint path for the selected DINOv2 backbone.",
+    )
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        default=None,
+        help="Path to a training checkpoint (.pth) to resume from.",
     )
     parser.add_argument(
         "--output-dir",
@@ -241,9 +260,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-object-class", action="store_false", dest="include_no_object")
     parser.set_defaults(include_no_object=True)
     parser.add_argument("--no-spectral-prior", action="store_true")
-    parser.add_argument("--spectral-blur-kernel-size", type=int, default=31)
-    parser.add_argument("--spectral-blur-sigma", type=float, default=6.0)
+    parser.add_argument(
+        "--spectral-blur-kernel-size",
+        type=int,
+        default=31,
+        help="Legacy no-op for backward config compatibility.",
+    )
+    parser.add_argument(
+        "--spectral-blur-sigma",
+        type=float,
+        default=6.0,
+        help="Legacy no-op for backward config compatibility.",
+    )
     parser.add_argument("--spectral-branch-channels", type=int, default=64)
+    parser.add_argument(
+        "--spectral-patch-size",
+        type=int,
+        default=8,
+        help="Patch size used for patch-wise DCT prior extraction.",
+    )
+    parser.add_argument(
+        "--spectral-dct-keep-size",
+        type=int,
+        default=4,
+        help="Keep a top-left KxK DCT block per patch (read in zig-zag order).",
+    )
+    parser.add_argument(
+        "--spectral-drop-dc",
+        action="store_true",
+        help="Drop the patch DC coefficient before the spectral MLP encoder.",
+    )
     parser.add_argument(
         "--spectral-fuse-level-indices",
         type=str,
@@ -1078,6 +1124,7 @@ def save_checkpoint(
     global_epoch: int,
     model: DINOv2DINOModel,
     optimizer: OptimizerLike,
+    schedulers: Sequence[torch.optim.lr_scheduler.LRScheduler],
     train_loss: float,
     val_loss: float,
     args_dict: Dict[str, object],
@@ -1090,6 +1137,7 @@ def save_checkpoint(
         "global_epoch": global_epoch,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "schedulers": [scheduler.state_dict() for scheduler in schedulers],
         "train_loss": train_loss,
         "val_loss": val_loss,
         "args": args_dict,
@@ -1209,15 +1257,25 @@ def parse_spectral_fuse_level_indices(raw_value: Any) -> Tuple[int, ...]:
 
 
 def validate_spectral_args(args: argparse.Namespace) -> Tuple[int, ...]:
-    if args.spectral_blur_kernel_size <= 0 or args.spectral_blur_kernel_size % 2 == 0:
-        raise ValueError(
-            f"--spectral-blur-kernel-size must be a positive odd integer, got {args.spectral_blur_kernel_size}."
-        )
-    if args.spectral_blur_sigma <= 0:
-        raise ValueError(f"--spectral-blur-sigma must be positive, got {args.spectral_blur_sigma}.")
     if args.spectral_branch_channels <= 0:
         raise ValueError(
             f"--spectral-branch-channels must be a positive integer, got {args.spectral_branch_channels}."
+        )
+    if args.spectral_patch_size <= 0:
+        raise ValueError(f"--spectral-patch-size must be a positive integer, got {args.spectral_patch_size}.")
+    if args.spectral_dct_keep_size <= 0:
+        raise ValueError(
+            f"--spectral-dct-keep-size must be a positive integer, got {args.spectral_dct_keep_size}."
+        )
+    if args.spectral_dct_keep_size > args.spectral_patch_size:
+        raise ValueError(
+            f"--spectral-dct-keep-size ({args.spectral_dct_keep_size}) cannot exceed "
+            f"--spectral-patch-size ({args.spectral_patch_size})."
+        )
+    if args.spectral_drop_dc and args.spectral_dct_keep_size == 1:
+        raise ValueError(
+            "--spectral-drop-dc with --spectral-dct-keep-size=1 removes all coefficients. "
+            "Increase --spectral-dct-keep-size or disable --spectral-drop-dc."
         )
 
     fuse_indices = parse_spectral_fuse_level_indices(args.spectral_fuse_level_indices)
@@ -1394,9 +1452,10 @@ def main() -> None:
         freeze_backbone=False,
         use_spectral_prior=not args.no_spectral_prior,
         spectral_fuse_level_indices=fused_level_indices,
-        spectral_blur_kernel_size=args.spectral_blur_kernel_size,
-        spectral_blur_sigma=args.spectral_blur_sigma,
         spectral_branch_channels=args.spectral_branch_channels,
+        spectral_patch_size=args.spectral_patch_size,
+        spectral_dct_keep_size=args.spectral_dct_keep_size,
+        spectral_drop_dc=args.spectral_drop_dc,
     ).to(device)
     if wandb_run is not None:
         wandb_run.config.update(serialize_args(args), allow_val_change=True)
@@ -1430,8 +1489,67 @@ def main() -> None:
     args_dict = serialize_args(args)
     (args.output_dir / "config.json").write_text(json.dumps(args_dict, indent=2), encoding="utf-8")
 
+    best_path = args.output_dir / "best.pth"
     best_val = math.inf
+    if best_path.exists():
+        try:
+            best_payload = torch.load(best_path, map_location="cpu")
+            if isinstance(best_payload, dict) and "best_val_loss" in best_payload:
+                best_val = float(best_payload["best_val_loss"])
+                print(f"Loaded existing best validation loss from {best_path}: {best_val:.4f}")
+        except Exception as exc:
+            print(f"Warning: failed to read existing best checkpoint at {best_path}: {exc}")
+
     global_epoch = 0
+    resume_phase_idx: Optional[int] = None
+    resume_epoch_in_phase = 0
+    resume_optimizer_state: Optional[Dict[str, Any]] = None
+    resume_scheduler_states: Optional[List[Dict[str, Any]]] = None
+    phase_name_to_idx = {phase_name: idx for idx, (phase_name, _, _, _) in enumerate(phases)}
+
+    if args.resume_checkpoint is not None:
+        resume_payload = torch.load(args.resume_checkpoint, map_location=device)
+        if not isinstance(resume_payload, dict):
+            raise ValueError(
+                f"Checkpoint payload must be a dictionary, got {type(resume_payload).__name__} "
+                f"from {args.resume_checkpoint}."
+            )
+        if "model" not in resume_payload:
+            raise KeyError(f"Checkpoint {args.resume_checkpoint} does not contain a 'model' state dict.")
+        if "optimizer" not in resume_payload:
+            raise KeyError(
+                f"Checkpoint {args.resume_checkpoint} does not contain an 'optimizer' state dict. "
+                "Use a per-epoch training checkpoint (e.g., phase_a_epoch_XXX.pth), not best.pth."
+            )
+        phase_name = resume_payload.get("phase")
+        if not isinstance(phase_name, str) or phase_name not in phase_name_to_idx:
+            valid_phase_names = tuple(phase_name_to_idx.keys())
+            raise ValueError(
+                f"Checkpoint {args.resume_checkpoint} has invalid phase '{phase_name}'. "
+                f"Expected one of {valid_phase_names}."
+            )
+
+        model.load_state_dict(resume_payload["model"], strict=True)
+        global_epoch = int(resume_payload.get("global_epoch", 0))
+        resume_phase_idx = phase_name_to_idx[phase_name]
+        resume_epoch_in_phase = int(resume_payload.get("epoch_in_phase", 0))
+        if resume_epoch_in_phase < 0:
+            raise ValueError(f"Invalid epoch_in_phase={resume_epoch_in_phase} in {args.resume_checkpoint}.")
+        resume_optimizer_state = resume_payload["optimizer"]
+        scheduler_states_raw = resume_payload.get("schedulers")
+        if isinstance(scheduler_states_raw, list):
+            resume_scheduler_states = scheduler_states_raw
+
+        checkpoint_val_loss = resume_payload.get("val_loss")
+        if checkpoint_val_loss is not None:
+            best_val = min(best_val, float(checkpoint_val_loss))
+
+        print(
+            "Resuming from checkpoint: "
+            f"{args.resume_checkpoint} | phase={phase_name} | "
+            f"epoch_in_phase={resume_epoch_in_phase} | global_epoch={global_epoch}"
+        )
+
     correct_shampoo_beta_bias: Optional[bool]
     if args.soap_correct_shampoo_beta_bias == "none":
         correct_shampoo_beta_bias = None
@@ -1464,9 +1582,28 @@ def main() -> None:
         "adam_eps": args.muon_adam_eps,
     }
 
-    for phase_name, phase_epochs, freeze_backbone, backbone_lr_mult in phases:
+    for phase_idx, (phase_name, phase_epochs, freeze_backbone, backbone_lr_mult) in enumerate(phases):
         if phase_epochs <= 0:
             continue
+
+        if resume_phase_idx is not None and phase_idx < resume_phase_idx:
+            print(f"Skipping {phase_name}; already completed before resume checkpoint.")
+            continue
+
+        start_epoch = 1
+        should_restore_phase_state = False
+        if resume_phase_idx is not None and phase_idx == resume_phase_idx:
+            start_epoch = resume_epoch_in_phase + 1
+            if start_epoch > phase_epochs:
+                print(
+                    f"Skipping {phase_name}; checkpoint already completed this phase "
+                    f"({resume_epoch_in_phase}/{phase_epochs} epochs)."
+                )
+                resume_phase_idx = None
+                resume_optimizer_state = None
+                resume_scheduler_states = None
+                continue
+            should_restore_phase_state = True
 
         set_backbone_trainable(model, trainable=not freeze_backbone)
         optimizer = build_optimizer(
@@ -1479,6 +1616,24 @@ def main() -> None:
             muon_args=muon_args,
         )
         schedulers = build_schedulers(optimizer, t_max=phase_epochs)
+        if should_restore_phase_state:
+            if resume_optimizer_state is None:
+                raise RuntimeError("Missing optimizer state while attempting to resume training.")
+            optimizer.load_state_dict(resume_optimizer_state)
+            if resume_scheduler_states is not None and len(resume_scheduler_states) == len(schedulers):
+                for scheduler, scheduler_state in zip(schedulers, resume_scheduler_states):
+                    scheduler.load_state_dict(scheduler_state)
+            elif resume_epoch_in_phase > 0:
+                # Backward compatibility for checkpoints created before scheduler states were saved.
+                for _ in range(resume_epoch_in_phase):
+                    for scheduler in schedulers:
+                        scheduler.step()
+            print(
+                f"Restored optimizer/scheduler state for {phase_name}; resuming at epoch {start_epoch}/{phase_epochs}."
+            )
+            resume_phase_idx = None
+            resume_optimizer_state = None
+            resume_scheduler_states = None
 
         print(
             f"\n=== {phase_name} | epochs={phase_epochs} | "
@@ -1486,7 +1641,7 @@ def main() -> None:
             f"backbone_lr={args.lr * backbone_lr_mult:.2e} | head_lr={args.lr:.2e} ==="
         )
 
-        for epoch in range(1, phase_epochs + 1):
+        for epoch in range(start_epoch, phase_epochs + 1):
             global_epoch += 1
             print(f"\n[{phase_name}] epoch {epoch}/{phase_epochs} (global {global_epoch})")
             train_loss = run_epoch(
@@ -1520,6 +1675,7 @@ def main() -> None:
                 global_epoch=global_epoch,
                 model=model,
                 optimizer=optimizer,
+                schedulers=schedulers,
                 train_loss=train_loss,
                 val_loss=val_loss,
                 args_dict=args_dict,
@@ -1528,7 +1684,6 @@ def main() -> None:
 
             if val_loss < best_val:
                 best_val = val_loss
-                best_path = args.output_dir / "best.pth"
                 torch.save(
                     {
                         "phase": phase_name,

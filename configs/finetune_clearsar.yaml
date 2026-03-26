@@ -1,0 +1,98 @@
+# ClearSAR finetune config (all available args from scripts/finetune_clearsar.py)
+# CLI usage:
+# python3 scripts/finetune_clearsar.py --config configs/finetune_clearsar.yaml
+
+config: null
+
+data_root: src/data/ClearSAR/data
+train_ann: null
+val_ann: null
+test_ann: null
+images_root: null
+test_images_root: null
+train_val_split_ratio: 0.2
+train_val_split_seed: 42
+no_auto_train_val_split: false
+
+backbone_name: vit_small_patch14_dinov2
+backbone_checkpoint: null
+resume_checkpoint: null
+output_dir: outputs/clearsar_finetune
+
+image_size: 224
+batch_size: 4
+num_workers: 1
+eval_score_threshold: 0.05
+eval_topk: 300
+
+phase_a_epochs: 70
+phase_b_epochs: 0
+optimizer: muon
+lr: 0.0001
+backbone_lr_mult: 0.001
+weight_decay: 0.0001
+grad_clip_norm: 1
+soap_betas: [0.9, 0.95]
+soap_shampoo_beta: 0.95
+soap_eps: 1.0e-8
+soap_weight_decay_method: decoupled
+soap_nesterov: false
+soap_precondition_frequency: 1
+soap_adam_warmup_steps: 0
+soap_correct_bias: false
+soap_fp32_matmul_prec: high
+soap_use_eigh: false
+soap_qr_fp32_matmul_prec: high
+soap_use_adaptive_criteria: false
+soap_adaptive_update_tolerance: 1.0e-7
+soap_power_iter_steps: 1
+soap_max_update_rms: 0.0
+soap_no_kl_shampoo: false
+soap_correct_shampoo_beta_bias: none
+muon_lr_mult: 5.0
+muon_momentum: 0.9
+muon_adam_betas: [0.9, 0.95]
+muon_adam_eps: 1.0e-8
+
+num_classes: null
+num_queries: 100
+hidden_dim: 256
+num_feature_levels: 4
+nheads: 8
+num_encoder_layers: 4
+num_decoder_layers: 4
+dim_feedforward: 1024
+dropout: 0.1
+enc_n_points: 4
+dec_n_points: 4
+no_two_stage: false
+no_box_refine: false
+include_no_object: true
+no_spectral_prior: false
+spectral_blur_kernel_size: 31
+spectral_blur_sigma: 6.0
+spectral_branch_channels: 64
+spectral_patch_size: 8
+spectral_dct_keep_size: 4
+spectral_drop_dc: false
+spectral_fuse_level_indices: "1,2,3"
+
+cls_loss_coef: 1.0
+bbox_loss_coef: 5.0
+giou_loss_coef: 2.0
+eos_coef: 0.1
+
+seed: 42
+device: cuda
+print_freq: 10
+wandb_enable: false
+wandb_project: clearsar-finetune
+wandb_entity: null
+wandb_run_name: null
+wandb_group: null
+wandb_job_type: train
+wandb_tags: null
+wandb_mode: online
+wandb_use_sweep_config: false
+wandb_watch: false
+wandb_log_freq: 100
