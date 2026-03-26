@@ -17,7 +17,7 @@ parameters:
   phase_a_epochs:
     values: [2, 3, 5]
   optimizer:
-    values: ["adamw", "kl_shampoo"]
+    values: ["adamw", "kl_shampoo", "muon"]
   soap_shampoo_beta:
     values: [0.9, 0.95, 0.98]
 

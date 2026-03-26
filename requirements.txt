@@ -8,6 +8,7 @@ click==8.3.1
 cuda-bindings==12.9.4
 cuda-pathfinder==1.4.3
 emerging-optimizers @ file:///home/georg/Documents/ESA/Emerging-Optimizers
+muon-optimizer @ git+https://github.com/KellerJordan/Muon.git
 filelock==3.25.2
 fsspec==2026.2.0
 h11==0.16.0

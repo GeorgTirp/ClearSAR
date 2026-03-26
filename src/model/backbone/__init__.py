@@ -1,3 +1,9 @@
+from .dinov2_backbone import (
+    DINOV2_BACKBONE_CHOICES,
+    DINOV2_PATCH_SIZE,
+    DINOv2Backbone,
+    build_dinov2_backbone,
+)
 from .summit_backbone import (
     SUMMITBackbone,
     build_summit_backbone,
@@ -8,6 +14,10 @@ from .summit_backbone import (
 )
 
 __all__ = [
+    "DINOV2_BACKBONE_CHOICES",
+    "DINOV2_PATCH_SIZE",
+    "DINOv2Backbone",
+    "build_dinov2_backbone",
     "SUMMITBackbone",
     "infer_summit_backbone_config",
     "build_summit_backbone",

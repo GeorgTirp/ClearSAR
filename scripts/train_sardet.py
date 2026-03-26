@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.model import SummitDINOModel
-from src.optim import MultiOptimizer, build_kl_shampoo_optimizer
+from src.optim import MultiOptimizer, build_kl_shampoo_optimizer, build_muon_optimizer
 
 
 PATH_CONFIG_KEYS = {
@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--phase-a-epochs", type=int, default=5)
     parser.add_argument("--phase-b-epochs", type=int, default=45)
-    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "kl_shampoo"])
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "kl_shampoo", "muon"])
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--backbone-lr-mult", type=float, default=0.1)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -128,6 +128,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
         choices=["none", "true", "false"],
     )
+    parser.add_argument("--muon-lr-mult", type=float, default=20.0)
+    parser.add_argument("--muon-momentum", type=float, default=0.95)
+    parser.add_argument("--muon-adam-betas", type=float, nargs=2, default=(0.9, 0.95))
+    parser.add_argument("--muon-adam-eps", type=float, default=1e-8)
 
     parser.add_argument("--num-classes", type=int, default=None)
     parser.add_argument("--num-queries", type=int, default=300)
@@ -582,6 +586,7 @@ def build_optimizer(
     backbone_lr_mult: float,
     weight_decay: float,
     soap_args: Dict[str, Any],
+    muon_args: Dict[str, Any],
 ) -> OptimizerLike:
     backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
     other_params = [
@@ -621,6 +626,16 @@ def build_optimizer(
             use_kl_shampoo=soap_args["use_kl_shampoo"],
             correct_shampoo_beta_bias=soap_args["correct_shampoo_beta_bias"],
             matrix_only=True,
+        )
+    if optimizer_name == "muon":
+        return build_muon_optimizer(
+            params=param_groups,
+            lr=lr,
+            weight_decay=weight_decay,
+            muon_lr_mult=muon_args["lr_mult"],
+            muon_momentum=muon_args["momentum"],
+            adam_betas=muon_args["adam_betas"],
+            adam_eps=muon_args["adam_eps"],
         )
     raise ValueError(f"Unknown optimizer '{optimizer_name}'.")
 
@@ -732,6 +747,8 @@ def _coerce_wandb_value(key: str, current_value: Any, new_value: Any) -> Any:
     if isinstance(current_value, Path) and new_value is not None:
         return Path(new_value)
     if key == "soap_betas" and isinstance(new_value, (list, tuple)):
+        return tuple(float(v) for v in new_value)
+    if key == "muon_adam_betas" and isinstance(new_value, (list, tuple)):
         return tuple(float(v) for v in new_value)
     if isinstance(current_value, tuple) and isinstance(new_value, (list, tuple)):
         return tuple(new_value)
@@ -926,6 +943,12 @@ def main() -> None:
         "use_kl_shampoo": not args.soap_no_kl_shampoo,
         "correct_shampoo_beta_bias": correct_shampoo_beta_bias,
     }
+    muon_args: Dict[str, Any] = {
+        "lr_mult": args.muon_lr_mult,
+        "momentum": args.muon_momentum,
+        "adam_betas": tuple(args.muon_adam_betas),
+        "adam_eps": args.muon_adam_eps,
+    }
 
     for phase_name, phase_epochs, freeze_backbone, backbone_lr_mult in phases:
         if phase_epochs <= 0:
@@ -939,6 +962,7 @@ def main() -> None:
             backbone_lr_mult=backbone_lr_mult,
             weight_decay=args.weight_decay,
             soap_args=soap_args,
+            muon_args=muon_args,
         )
         schedulers = build_schedulers(optimizer, t_max=phase_epochs)
 

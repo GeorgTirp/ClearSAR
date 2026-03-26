@@ -3,3 +3,6 @@ checkpoints/summit/
 checkpoints/summit/checkpoint.pth
 wandb/
 job_outputs/
+outputs/
+src/models/__pycache__
+__pycache__/
