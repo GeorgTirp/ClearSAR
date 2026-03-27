@@ -13,10 +13,22 @@ test_images_root: null
 train_val_split_ratio: 0.2
 train_val_split_seed: 42
 no_auto_train_val_split: false
+val_originals_only: true
+augmented_filename_markers: "__flip_h,__flip_v,__crop,__aug"
+
+augment_train_after_split: false
+augmentation_output_root: null
+augmentation_crop_scale: 0.8
+augmentation_min_visible_frac: 0.2
+augmentation_min_box_area: 4.0
+augmentation_seed: 42
+augmentation_include_original: true
+augmentation_overwrite: false
+augmentation_strict: false
 
 backbone_name: vit_small_patch14_dinov2
 backbone_checkpoint: null
-resume_checkpoint: null
+resume_checkpoint: outputs/clearsar_finetune/phase_a_epoch_071.pth
 output_dir: outputs/clearsar_finetune
 
 image_size: 224
@@ -25,12 +37,12 @@ num_workers: 1
 eval_score_threshold: 0.05
 eval_topk: 300
 
-phase_a_epochs: 70
-phase_b_epochs: 0
+phase_a_epochs: 72
+phase_b_epochs: 210
 optimizer: muon
 lr: 0.0001
-backbone_lr_mult: 0.001
-weight_decay: 0.0001
+backbone_lr_mult: 0.1
+weight_decay: 0.001
 grad_clip_norm: 1
 soap_betas: [0.9, 0.95]
 soap_shampoo_beta: 0.95

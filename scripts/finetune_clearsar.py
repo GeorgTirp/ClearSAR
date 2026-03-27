@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.model import DINOv2DINOModel
 from src.model.backbone import DINOV2_BACKBONE_CHOICES, DINOV2_PATCH_SIZE
 from src.optim import MultiOptimizer, build_kl_shampoo_optimizer, build_muon_optimizer
+from scripts.augmentation import augment_train_dataset
 
 
 PATH_CONFIG_KEYS = {
@@ -31,6 +32,7 @@ PATH_CONFIG_KEYS = {
     "test_ann",
     "images_root",
     "test_images_root",
+    "augmentation_output_root",
     "output_dir",
     "resume_checkpoint",
 }
@@ -41,6 +43,7 @@ OptimizerLike = torch.optim.Optimizer | MultiOptimizer
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 DEFAULT_SPECTRAL_FUSE_LEVELS = (1, 2, 3)
+DEFAULT_AUGMENTED_FILENAME_MARKERS = ("__flip_h", "__flip_v", "__crop", "__aug")
 
 
 def load_config_file(config_path: Optional[Path]) -> Dict[str, Any]:
@@ -81,6 +84,8 @@ def create_train_val_split_annotations(
     source_ann: Path,
     val_ratio: float,
     split_seed: int,
+    val_originals_only: bool = False,
+    augmented_filename_markers: Sequence[str] = DEFAULT_AUGMENTED_FILENAME_MARKERS,
 ) -> Tuple[Path, Path]:
     if not (0.0 < val_ratio < 1.0):
         raise ValueError(f"train/val split ratio must be in (0, 1), got {val_ratio}.")
@@ -92,7 +97,20 @@ def create_train_val_split_annotations(
         raise ValueError(f"No images found in annotation file: {source_ann}")
 
     image_ids = [int(image["id"]) for image in images]
-    shuffled_ids = image_ids[:]
+    if val_originals_only:
+        candidate_val_ids = [
+            int(image["id"])
+            for image in images
+            if not is_augmented_image_entry(image, augmented_filename_markers)
+        ]
+        if not candidate_val_ids:
+            raise ValueError(
+                "Validation split requested originals-only images, but no original images were "
+                f"found in {source_ann}. Disable --val-originals-only or check augmented filename markers."
+            )
+        shuffled_ids = candidate_val_ids[:]
+    else:
+        shuffled_ids = image_ids[:]
     rng = random.Random(split_seed)
     rng.shuffle(shuffled_ids)
 
@@ -106,7 +124,7 @@ def create_train_val_split_annotations(
         )
 
     val_ids = set(shuffled_ids[:val_count])
-    train_ids = set(shuffled_ids[val_count:])
+    train_ids = set(image_ids) - val_ids
     if not train_ids:
         raise ValueError("Auto split produced an empty training set.")
 
@@ -163,6 +181,88 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-auto-train-val-split",
         action="store_true",
         help="Disable automatic train/val split generation when no val annotation file is found.",
+    )
+    parser.add_argument(
+        "--val-originals-only",
+        action="store_true",
+        help=(
+            "Exclude augmented samples from validation/evaluation datasets. "
+            "When auto-splitting train annotations, only original images can be chosen for validation."
+        ),
+    )
+    parser.add_argument(
+        "--no-val-originals-only",
+        action="store_false",
+        dest="val_originals_only",
+        help="Allow augmented samples in validation/evaluation datasets.",
+    )
+    parser.set_defaults(val_originals_only=True)
+    parser.add_argument(
+        "--augmented-filename-markers",
+        type=str,
+        default=",".join(DEFAULT_AUGMENTED_FILENAME_MARKERS),
+        help=(
+            "Comma-separated substrings used to detect augmented images by file_name "
+            "(used when image metadata does not include is_augmented)."
+        ),
+    )
+    parser.add_argument(
+        "--augment-train-after-split",
+        action="store_true",
+        help=(
+            "Run dataset augmentation automatically before training (after auto train/val split if it is used). "
+            "The augmented train annotation replaces --train-ann for this run."
+        ),
+    )
+    parser.add_argument(
+        "--augmentation-output-root",
+        type=Path,
+        default=None,
+        help=(
+            "Output dataset root used by --augment-train-after-split. "
+            "Defaults to <output-dir>/runtime_augmented_data."
+        ),
+    )
+    parser.add_argument(
+        "--augmentation-crop-scale",
+        type=float,
+        default=0.8,
+        help="Crop scale forwarded to runtime augmentation.",
+    )
+    parser.add_argument(
+        "--augmentation-min-visible-frac",
+        type=float,
+        default=0.2,
+        help="Minimum visible bbox fraction forwarded to runtime augmentation.",
+    )
+    parser.add_argument(
+        "--augmentation-min-box-area",
+        type=float,
+        default=4.0,
+        help="Minimum cropped bbox area forwarded to runtime augmentation.",
+    )
+    parser.add_argument(
+        "--augmentation-seed",
+        type=int,
+        default=42,
+        help="Seed forwarded to runtime augmentation.",
+    )
+    parser.add_argument(
+        "--no-augmentation-include-original",
+        action="store_false",
+        dest="augmentation_include_original",
+        help="Use only generated augmentations in the runtime-augmented train annotation.",
+    )
+    parser.set_defaults(augmentation_include_original=True)
+    parser.add_argument(
+        "--augmentation-overwrite",
+        action="store_true",
+        help="Overwrite --augmentation-output-root if it already exists.",
+    )
+    parser.add_argument(
+        "--augmentation-strict",
+        action="store_true",
+        help="Fail runtime augmentation on first missing source image.",
     )
 
     parser.add_argument(
@@ -382,17 +482,53 @@ def generalized_box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Ten
 
 
 class ClearSARCocoDataset(Dataset):
-    def __init__(self, images_root: Path, ann_file: Path, image_size: int) -> None:
+    def __init__(
+        self,
+        images_root: Path,
+        ann_file: Path,
+        image_size: int,
+        originals_only: bool = False,
+        augmented_filename_markers: Sequence[str] = DEFAULT_AUGMENTED_FILENAME_MARKERS,
+    ) -> None:
         self.images_root = images_root
         self.ann_file = ann_file
         self.image_size = image_size
         self.image_search_subdirs = self._infer_image_search_subdirs(ann_file)
+        self.augmented_filename_markers = tuple(augmented_filename_markers)
 
         data = json.loads(ann_file.read_text(encoding="utf-8"))
-        self.images = sorted(data["images"], key=lambda x: x["id"])
+        all_images = sorted(data["images"], key=lambda x: x["id"])
+        all_annotations = data["annotations"]
+        if originals_only:
+            kept_images = [
+                image
+                for image in all_images
+                if not is_augmented_image_entry(image, self.augmented_filename_markers)
+            ]
+            if not kept_images:
+                raise ValueError(
+                    "Validation originals-only filtering removed all images from "
+                    f"{ann_file}. Disable --val-originals-only or adjust --augmented-filename-markers."
+                )
+            kept_ids = {int(image["id"]) for image in kept_images}
+            kept_annotations = [ann for ann in all_annotations if int(ann["image_id"]) in kept_ids]
+            removed_images = len(all_images) - len(kept_images)
+            removed_annotations = len(all_annotations) - len(kept_annotations)
+            if removed_images > 0:
+                print(
+                    "[dataset] originals-only filter: "
+                    f"ann={ann_file.name} removed_images={removed_images} "
+                    f"removed_annotations={removed_annotations} "
+                    f"markers={self.augmented_filename_markers}"
+                )
+            self.images = kept_images
+            annotations = kept_annotations
+        else:
+            self.images = all_images
+            annotations = all_annotations
         self.categories = sorted(data["categories"], key=lambda x: x["id"])
         self.image_to_anns: Dict[int, List[Dict]] = {}
-        for ann in data["annotations"]:
+        for ann in annotations:
             image_id = int(ann["image_id"])
             self.image_to_anns.setdefault(image_id, []).append(ann)
 
@@ -473,6 +609,46 @@ class ClearSARCocoDataset(Dataset):
 def collate_fn(batch: Sequence[Tuple[torch.Tensor, Dict[str, torch.Tensor]]]) -> Tuple[torch.Tensor, List[Dict[str, torch.Tensor]]]:
     images, targets = zip(*batch)
     return torch.stack(list(images), dim=0), list(targets)
+
+
+def parse_augmented_filename_markers(raw_value: Any) -> Tuple[str, ...]:
+    values: List[str]
+    if isinstance(raw_value, str):
+        values = [part.strip().lower() for part in raw_value.split(",")]
+    elif isinstance(raw_value, (list, tuple)):
+        values = [str(part).strip().lower() for part in raw_value]
+    else:
+        raise ValueError(
+            "--augmented-filename-markers must be a comma-separated string or sequence of strings."
+        )
+
+    markers = tuple(dict.fromkeys(value for value in values if value != ""))
+    if len(markers) == 0:
+        raise ValueError("--augmented-filename-markers cannot be empty.")
+    return markers
+
+
+def is_augmented_image_entry(image_entry: Dict[str, Any], markers: Sequence[str]) -> bool:
+    explicit_flag = image_entry.get("is_augmented")
+    if explicit_flag is not None:
+        return bool(explicit_flag)
+    file_name = str(image_entry.get("file_name", "")).lower()
+    return any(marker in file_name for marker in markers)
+
+
+def infer_augmentation_train_images_root(images_root: Path) -> Path:
+    train_dir = images_root / "train"
+    if train_dir.exists():
+        return train_dir
+    return images_root
+
+
+def remap_path_under_new_root(path: Path, source_root: Path, target_root: Path) -> Path:
+    try:
+        rel = path.resolve().relative_to(source_root.resolve())
+    except ValueError:
+        return path
+    return target_root / rel
 
 
 def _linear_sum_assignment_np(cost_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -1302,6 +1478,8 @@ def main() -> None:
     args = parse_args()
     wandb_run, _ = maybe_init_wandb(args)
     set_seed(args.seed)
+    augmented_filename_markers = parse_augmented_filename_markers(args.augmented_filename_markers)
+    args.augmented_filename_markers = augmented_filename_markers
 
     default_train_ann_candidates = [
         args.data_root / "annotations" / "instances_train.json",
@@ -1343,6 +1521,8 @@ def main() -> None:
                     source_ann=args.train_ann,
                     val_ratio=args.train_val_split_ratio,
                     split_seed=args.train_val_split_seed,
+                    val_originals_only=args.val_originals_only,
+                    augmented_filename_markers=augmented_filename_markers,
                 )
                 args.train_ann = split_train_ann
                 args.val_ann = split_val_ann
@@ -1371,6 +1551,48 @@ def main() -> None:
                 args.test_images_root = candidate_test_root
         if args.test_images_root is None:
             args.test_images_root = args.images_root
+    source_data_root_for_remap = args.data_root
+    if args.augment_train_after_split:
+        augmentation_output_root = (
+            args.augmentation_output_root
+            if args.augmentation_output_root is not None
+            else args.output_dir / "runtime_augmented_data"
+        )
+        augmentation_train_images_root = infer_augmentation_train_images_root(args.images_root)
+        augmentation_output_ann = augmentation_output_root / "annotations" / args.train_ann.name
+
+        augment_summary = augment_train_dataset(
+            source_data_root=source_data_root_for_remap,
+            output_data_root=augmentation_output_root,
+            train_ann=args.train_ann,
+            images_root=augmentation_train_images_root,
+            output_ann=augmentation_output_ann,
+            output_images_dir=augmentation_output_root / "images" / "train",
+            crop_scale=args.augmentation_crop_scale,
+            min_visible_frac=args.augmentation_min_visible_frac,
+            min_box_area=args.augmentation_min_box_area,
+            seed=args.augmentation_seed,
+            include_original=args.augmentation_include_original,
+            overwrite=args.augmentation_overwrite,
+            strict=args.augmentation_strict,
+        )
+
+        args.augmentation_output_root = augmentation_output_root
+        args.data_root = augmentation_output_root
+        args.train_ann = Path(augment_summary["output_ann"])
+        args.val_ann = remap_path_under_new_root(args.val_ann, source_data_root_for_remap, augmentation_output_root)
+        args.test_ann = remap_path_under_new_root(args.test_ann, source_data_root_for_remap, augmentation_output_root)
+        args.images_root = remap_path_under_new_root(args.images_root, source_data_root_for_remap, augmentation_output_root)
+        args.test_images_root = remap_path_under_new_root(
+            args.test_images_root,
+            source_data_root_for_remap,
+            augmentation_output_root,
+        )
+        print(
+            "Runtime augmentation enabled: "
+            f"train_ann={args.train_ann} val_ann={args.val_ann} "
+            f"images_root={args.images_root} data_root={args.data_root}"
+        )
     if args.image_size <= 0:
         raise ValueError("--image-size must be a positive integer for DINOv2 fine-tuning.")
     if args.image_size % DINOV2_PATCH_SIZE != 0:
@@ -1401,11 +1623,15 @@ def main() -> None:
         images_root=args.images_root,
         ann_file=args.train_ann,
         image_size=args.image_size,
+        originals_only=False,
+        augmented_filename_markers=augmented_filename_markers,
     )
     val_dataset = ClearSARCocoDataset(
         images_root=args.images_root,
         ann_file=args.val_ann,
         image_size=args.image_size,
+        originals_only=args.val_originals_only,
+        augmented_filename_markers=augmented_filename_markers,
     )
 
     train_loader = DataLoader(
@@ -1723,6 +1949,8 @@ def main() -> None:
         images_root=args.test_images_root,
         ann_file=args.test_ann,
         image_size=args.image_size,
+        originals_only=args.val_originals_only and "test" not in args.test_ann.stem.lower(),
+        augmented_filename_markers=augmented_filename_markers,
     )
     eval_loader = DataLoader(
         eval_dataset,

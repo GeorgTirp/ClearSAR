@@ -1,3 +1,4 @@
+import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -53,18 +54,40 @@ class SimpleFeaturePyramid(nn.Module):
         return outputs
 
 
-def _make_gaussian_kernel2d(kernel_size: int, sigma: float) -> torch.Tensor:
-    if kernel_size <= 0 or kernel_size % 2 == 0:
-        raise ValueError(f"Gaussian kernel size must be positive odd, got {kernel_size}.")
-    if sigma <= 0:
-        raise ValueError(f"Gaussian sigma must be positive, got {sigma}.")
+def _make_dct_basis(size: int) -> torch.Tensor:
+    if size <= 0:
+        raise ValueError(f"DCT basis size must be > 0, got {size}.")
 
-    radius = kernel_size // 2
-    coords = torch.arange(-radius, radius + 1, dtype=torch.float32)
-    kernel_1d = torch.exp(-(coords * coords) / (2.0 * sigma * sigma))
-    kernel_1d = kernel_1d / kernel_1d.sum()
-    kernel_2d = torch.outer(kernel_1d, kernel_1d)
-    return kernel_2d.view(1, 1, kernel_size, kernel_size)
+    positions = torch.arange(size, dtype=torch.float32)
+    frequencies = torch.arange(size, dtype=torch.float32).unsqueeze(1)
+    basis = torch.cos((math.pi / size) * (positions + 0.5) * frequencies)
+    basis[0] *= math.sqrt(1.0 / size)
+    if size > 1:
+        basis[1:] *= math.sqrt(2.0 / size)
+    return basis
+
+
+def _zigzag_indices(block_size: int) -> List[Tuple[int, int]]:
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0, got {block_size}.")
+
+    indices: List[Tuple[int, int]] = []
+    for diagonal in range(2 * block_size - 1):
+        if diagonal % 2 == 0:
+            row = min(diagonal, block_size - 1)
+            col = diagonal - row
+            while row >= 0 and col < block_size:
+                indices.append((row, col))
+                row -= 1
+                col += 1
+        else:
+            col = min(diagonal, block_size - 1)
+            row = diagonal - col
+            while col >= 0 and row < block_size:
+                indices.append((row, col))
+                row += 1
+                col -= 1
+    return indices
 
 
 class SpectralPriorBranch(nn.Module):
@@ -72,28 +95,42 @@ class SpectralPriorBranch(nn.Module):
         self,
         num_feature_levels: int,
         branch_channels: int = 64,
-        blur_kernel_size: int = 31,
-        blur_sigma: float = 6.0,
+        patch_size: int = 8,
+        dct_keep_size: int = 4,
+        drop_dc: bool = False,
     ) -> None:
         super().__init__()
         if num_feature_levels <= 0:
             raise ValueError(f"num_feature_levels must be > 0, got {num_feature_levels}.")
         if branch_channels <= 0:
             raise ValueError(f"branch_channels must be > 0, got {branch_channels}.")
+        if patch_size <= 0:
+            raise ValueError(f"patch_size must be > 0, got {patch_size}.")
+        if dct_keep_size <= 0:
+            raise ValueError(f"dct_keep_size must be > 0, got {dct_keep_size}.")
+        if dct_keep_size > patch_size:
+            raise ValueError(f"dct_keep_size ({dct_keep_size}) cannot exceed patch_size ({patch_size}).")
 
+        zigzag_block = _zigzag_indices(dct_keep_size)
+        coeff_indices = [row * patch_size + col for row, col in zigzag_block]
+        if drop_dc:
+            coeff_indices = coeff_indices[1:]
+        if len(coeff_indices) == 0:
+            raise ValueError("No DCT coefficients selected. Increase dct_keep_size or disable drop_dc.")
+
+        self.patch_size = patch_size
         self.num_feature_levels = num_feature_levels
-        self.blur_kernel_size = blur_kernel_size
-        self.blur_sigma = blur_sigma
-        self.register_buffer(
-            "_gaussian_kernel",
-            _make_gaussian_kernel2d(kernel_size=blur_kernel_size, sigma=blur_sigma),
-            persistent=False,
-        )
+        self.dct_keep_size = dct_keep_size
+        self.drop_dc = drop_dc
+        self.num_kept_coeffs = len(coeff_indices)
+        self.register_buffer("_dct_basis", _make_dct_basis(patch_size), persistent=False)
+        self.register_buffer("_coeff_indices", torch.tensor(coeff_indices, dtype=torch.long), persistent=False)
 
-        self.prior_extractor = nn.Sequential(
-            nn.Conv2d(1, branch_channels, kernel_size=3, padding=1),
+        self.coeff_norm = nn.LayerNorm(self.num_kept_coeffs)
+        self.patch_encoder = nn.Sequential(
+            nn.Linear(self.num_kept_coeffs, branch_channels),
             nn.GELU(),
-            nn.Conv2d(branch_channels, branch_channels, kernel_size=3, padding=1),
+            nn.Linear(branch_channels, branch_channels),
             nn.GELU(),
         )
         self.level_projections = nn.ModuleList(
@@ -102,9 +139,9 @@ class SpectralPriorBranch(nn.Module):
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
-        for module in self.prior_extractor:
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+        for module in self.patch_encoder:
+            if isinstance(module, nn.Linear):
+                nn.init.trunc_normal_(module.weight, std=0.02)
                 nn.init.constant_(module.bias, 0)
         for projection in self.level_projections:
             nn.init.xavier_uniform_(projection.weight)
@@ -117,44 +154,55 @@ class SpectralPriorBranch(nn.Module):
                 f"got {tuple(images_denorm.shape)}."
             )
 
-        # Luma conversion keeps structural intensity for spectral extraction.
+        # Luma keeps structural information while staying lightweight.
         grayscale = (
             0.2989 * images_denorm[:, 0:1]
             + 0.5870 * images_denorm[:, 1:2]
             + 0.1140 * images_denorm[:, 2:3]
         )
+        mean = grayscale.mean(dim=(-2, -1), keepdim=True)
+        std = grayscale.std(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        return (grayscale - mean) / std
 
-        kernel = self._gaussian_kernel.to(device=images_denorm.device, dtype=images_denorm.dtype)
-        blurred = F.conv2d(grayscale, kernel, padding=self.blur_kernel_size // 2)
-        whitened = grayscale - blurred
+    def _extract_patch_features(self, normalized_gray: torch.Tensor) -> torch.Tensor:
+        batch_size, _, height, width = normalized_gray.shape
+        pad_h = (-height) % self.patch_size
+        pad_w = (-width) % self.patch_size
+        if pad_h > 0 or pad_w > 0:
+            normalized_gray = F.pad(normalized_gray, (0, pad_w, 0, pad_h), mode="replicate")
 
-        mean = whitened.mean(dim=(-2, -1), keepdim=True)
-        std = whitened.std(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
-        return (whitened - mean) / std
+        padded_h = normalized_gray.shape[-2]
+        padded_w = normalized_gray.shape[-1]
+        grid_h = padded_h // self.patch_size
+        grid_w = padded_w // self.patch_size
 
-    def _log_spectrum(self, whitened: torch.Tensor) -> torch.Tensor:
-        spectrum = torch.fft.fft2(whitened, dim=(-2, -1))
-        magnitude = spectrum.abs()
-        centered = torch.fft.fftshift(magnitude, dim=(-2, -1))
-        log_spectrum = torch.log1p(centered)
+        patches = F.unfold(normalized_gray, kernel_size=self.patch_size, stride=self.patch_size)
+        patches = patches.transpose(1, 2).reshape(-1, self.patch_size, self.patch_size)
 
-        mean = log_spectrum.mean(dim=(-2, -1), keepdim=True)
-        std = log_spectrum.std(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
-        return (log_spectrum - mean) / std
+        basis = self._dct_basis.to(device=normalized_gray.device, dtype=normalized_gray.dtype)
+        dct_rows = torch.matmul(basis, patches)
+        dct = torch.matmul(dct_rows, basis.transpose(0, 1))
+        dct_flat = dct.reshape(-1, self.patch_size * self.patch_size)
+        dct_selected = dct_flat.index_select(dim=1, index=self._coeff_indices)
+
+        tokens = self.coeff_norm(dct_selected)
+        tokens = self.patch_encoder(tokens)
+
+        encoded = tokens.view(batch_size, grid_h * grid_w, -1)
+        encoded = encoded.transpose(1, 2).reshape(batch_size, -1, grid_h, grid_w)
+        return encoded
 
     def forward(
         self,
         images_denorm: torch.Tensor,
         target_features: Sequence[torch.Tensor],
     ) -> List[torch.Tensor]:
-        # Keep FFT path in float32 for numerical stability and broader device support.
-        whitened = self._preprocess(images_denorm.float())
-        spectral_map = self._log_spectrum(whitened)
-        prior_features = self.prior_extractor(spectral_map)
+        normalized_gray = self._preprocess(images_denorm.float())
+        patch_features = self._extract_patch_features(normalized_gray)
 
         priors: List[torch.Tensor] = []
         for level_idx, feature in enumerate(target_features):
-            level_prior = self.level_projections[level_idx](prior_features)
+            level_prior = self.level_projections[level_idx](patch_features)
             level_prior = F.interpolate(
                 level_prior,
                 size=feature.shape[-2:],
@@ -290,8 +338,12 @@ class DINOv2DINOModel(nn.Module):
         spectral_blur_kernel_size: int = 31,
         spectral_blur_sigma: float = 6.0,
         spectral_branch_channels: int = 64,
+        spectral_patch_size: int = 8,
+        spectral_dct_keep_size: int = 4,
+        spectral_drop_dc: bool = False,
     ) -> None:
         super().__init__()
+        _ = spectral_blur_kernel_size, spectral_blur_sigma
         self.backbone: DINOv2Backbone = build_dinov2_backbone(
             model_name=backbone_name,
             checkpoint_path=backbone_checkpoint_path,
@@ -357,8 +409,9 @@ class DINOv2DINOModel(nn.Module):
             self.spectral_prior_branch = SpectralPriorBranch(
                 num_feature_levels=self.num_feature_levels,
                 branch_channels=spectral_branch_channels,
-                blur_kernel_size=spectral_blur_kernel_size,
-                blur_sigma=spectral_blur_sigma,
+                patch_size=spectral_patch_size,
+                dct_keep_size=spectral_dct_keep_size,
+                drop_dc=spectral_drop_dc,
             )
             self.spectral_alphas = nn.Parameter(torch.zeros(len(self.spectral_fuse_level_indices)))
         else:

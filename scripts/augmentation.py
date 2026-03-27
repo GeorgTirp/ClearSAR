@@ -223,36 +223,44 @@ def clone_annotation(
     return out
 
 
-def main() -> None:
-    args = parse_args()
+def augment_train_dataset(
+    source_data_root: Path,
+    output_data_root: Path,
+    train_ann: Optional[Path] = None,
+    images_root: Optional[Path] = None,
+    output_ann: Optional[Path] = None,
+    output_images_dir: Optional[Path] = None,
+    crop_scale: float = 0.8,
+    min_visible_frac: float = 0.2,
+    min_box_area: float = 4.0,
+    seed: int = 42,
+    include_original: bool = True,
+    overwrite: bool = False,
+    strict: bool = False,
+) -> Dict[str, Any]:
+    if not (0.0 < crop_scale <= 1.0):
+        raise ValueError(f"crop_scale must be in (0, 1], got {crop_scale}")
+    if not (0.0 <= min_visible_frac <= 1.0):
+        raise ValueError(f"min_visible_frac must be in [0, 1], got {min_visible_frac}")
+    if min_box_area < 0.0:
+        raise ValueError(f"min_box_area must be >= 0, got {min_box_area}")
 
-    if not (0.0 < args.crop_scale <= 1.0):
-        raise ValueError(f"--crop-scale must be in (0, 1], got {args.crop_scale}")
-    if not (0.0 <= args.min_visible_frac <= 1.0):
-        raise ValueError(f"--min-visible-frac must be in [0, 1], got {args.min_visible_frac}")
-    if args.min_box_area < 0.0:
-        raise ValueError(f"--min-box-area must be >= 0, got {args.min_box_area}")
+    source_train_ann = resolve_train_ann(source_data_root, train_ann)
+    source_train_images_root = resolve_source_train_images_root(source_data_root, images_root)
 
-    source_train_ann = resolve_train_ann(args.source_data_root, args.train_ann)
-    source_train_images_root = resolve_source_train_images_root(args.source_data_root, args.images_root)
-
-    output_ann = (
-        args.output_ann
-        if args.output_ann is not None
-        else args.output_data_root / "annotations" / "instances_train.json"
+    resolved_output_ann = (
+        output_ann if output_ann is not None else output_data_root / "annotations" / "instances_train.json"
     )
-    output_images_dir = (
-        args.output_images_dir
-        if args.output_images_dir is not None
-        else args.output_data_root / "images" / "train"
+    resolved_output_images_dir = (
+        output_images_dir if output_images_dir is not None else output_data_root / "images" / "train"
     )
 
     copy_source_dataset(
-        source_data_root=args.source_data_root,
-        output_data_root=args.output_data_root,
-        overwrite=args.overwrite,
+        source_data_root=source_data_root,
+        output_data_root=output_data_root,
+        overwrite=overwrite,
     )
-    output_images_dir.mkdir(parents=True, exist_ok=True)
+    resolved_output_images_dir.mkdir(parents=True, exist_ok=True)
 
     coco = read_json(source_train_ann)
     if not all(k in coco for k in ("images", "annotations", "categories")):
@@ -264,14 +272,18 @@ def main() -> None:
     for ann in annotations:
         ann_by_image[int(ann["image_id"])].append(ann)
 
-    include_original = not args.no_include_original
-    output_images: List[Dict[str, Any]] = [dict(img) for img in images] if include_original else []
+    output_images: List[Dict[str, Any]] = []
+    if include_original:
+        for image in images:
+            out_image = dict(image)
+            out_image["is_augmented"] = bool(out_image.get("is_augmented", False))
+            output_images.append(out_image)
     output_annotations: List[Dict[str, Any]] = [dict(ann) for ann in annotations] if include_original else []
 
     next_image_id = max((int(img["id"]) for img in output_images), default=-1) + 1
     next_ann_id = max((int(ann["id"]) for ann in output_annotations), default=-1) + 1
 
-    rng = random.Random(args.seed)
+    rng = random.Random(seed)
     missing_images = 0
     generated_images = 0
     generated_annotations = 0
@@ -284,7 +296,7 @@ def main() -> None:
         if src_path is None:
             missing_images += 1
             message = f"Missing source image for file_name='{src_file_name}' (images-root={source_train_images_root})"
-            if args.strict:
+            if strict:
                 raise FileNotFoundError(message)
             print(f"[skip] {message}")
             continue
@@ -301,7 +313,7 @@ def main() -> None:
             flip_mode = "h" if rng.random() < 0.5 else "v"
             flip_tag = "flip_h" if flip_mode == "h" else "flip_v"
             flip_out_name = f"{image_stem}_{src_image_id}__{flip_tag}{image_ext}"
-            flip_out_path = output_images_dir / flip_out_name
+            flip_out_path = resolved_output_images_dir / flip_out_name
             if flip_mode == "h":
                 flip_image = image.transpose(Image.FLIP_LEFT_RIGHT)
             else:
@@ -315,32 +327,34 @@ def main() -> None:
             flip_image_entry["file_name"] = flip_out_name
             flip_image_entry["width"] = width
             flip_image_entry["height"] = height
+            flip_image_entry["is_augmented"] = True
+            flip_image_entry["augmentation_type"] = flip_tag
+            flip_image_entry["source_image_id"] = src_image_id
             output_images.append(flip_image_entry)
             generated_images += 1
 
             for ann in anns:
-                bbox = flip_bbox_xywh(ann["bbox"], width=width, height=height, mode=flip_mode)
                 output_annotations.append(
                     clone_annotation(
                         base_ann=ann,
                         ann_id=next_ann_id,
                         image_id=flip_image_id,
-                        bbox_xywh=bbox,
+                        bbox_xywh=flip_bbox_xywh(ann["bbox"], width=width, height=height, mode=flip_mode),
                     )
                 )
                 next_ann_id += 1
                 generated_annotations += 1
 
             # Crop augmentation: random crop position with fixed crop-scale.
-            crop_width = max(1, min(width, int(round(width * args.crop_scale))))
-            crop_height = max(1, min(height, int(round(height * args.crop_scale))))
+            crop_width = max(1, min(width, int(round(width * crop_scale))))
+            crop_height = max(1, min(height, int(round(height * crop_scale))))
             max_left = max(0, width - crop_width)
             max_top = max(0, height - crop_height)
             crop_left = rng.randint(0, max_left)
             crop_top = rng.randint(0, max_top)
 
             crop_out_name = f"{image_stem}_{src_image_id}__crop{image_ext}"
-            crop_out_path = output_images_dir / crop_out_name
+            crop_out_path = resolved_output_images_dir / crop_out_name
             crop_image = image.crop((crop_left, crop_top, crop_left + crop_width, crop_top + crop_height))
             crop_image.save(crop_out_path)
 
@@ -351,6 +365,9 @@ def main() -> None:
             crop_image_entry["file_name"] = crop_out_name
             crop_image_entry["width"] = crop_width
             crop_image_entry["height"] = crop_height
+            crop_image_entry["is_augmented"] = True
+            crop_image_entry["augmentation_type"] = "crop"
+            crop_image_entry["source_image_id"] = src_image_id
             output_images.append(crop_image_entry)
             generated_images += 1
 
@@ -361,8 +378,8 @@ def main() -> None:
                     crop_top=crop_top,
                     crop_width=crop_width,
                     crop_height=crop_height,
-                    min_visible_frac=args.min_visible_frac,
-                    min_box_area=args.min_box_area,
+                    min_visible_frac=min_visible_frac,
+                    min_box_area=min_box_area,
                 )
                 if cropped_bbox is None:
                     dropped_crop_boxes += 1
@@ -381,20 +398,53 @@ def main() -> None:
     out_payload: Dict[str, Any] = {k: v for k, v in coco.items() if k not in {"images", "annotations"}}
     out_payload["images"] = output_images
     out_payload["annotations"] = output_annotations
+    write_json(resolved_output_ann, out_payload)
 
-    write_json(output_ann, out_payload)
-
+    summary = {
+        "source_root": source_data_root,
+        "output_root": output_data_root,
+        "output_ann": resolved_output_ann,
+        "output_images_dir": resolved_output_images_dir,
+        "base_images": len(images),
+        "base_annotations": len(annotations),
+        "generated_images": generated_images,
+        "generated_annotations": generated_annotations,
+        "dropped_crop_boxes": dropped_crop_boxes,
+        "missing_images": missing_images,
+        "include_original": include_original,
+        "seed": seed,
+    }
     print(
         "Augmentation complete: "
-        f"source_root={args.source_data_root} "
-        f"output_root={args.output_data_root} "
+        f"source_root={source_data_root} "
+        f"output_root={output_data_root} "
         f"base_images={len(images)} "
         f"base_annotations={len(annotations)} "
         f"generated_images={generated_images} "
         f"generated_annotations={generated_annotations} "
         f"dropped_crop_boxes={dropped_crop_boxes} "
         f"missing_images={missing_images} "
-        f"-> {output_ann}"
+        f"-> {resolved_output_ann}"
+    )
+    return summary
+
+
+def main() -> None:
+    args = parse_args()
+    augment_train_dataset(
+        source_data_root=args.source_data_root,
+        output_data_root=args.output_data_root,
+        train_ann=args.train_ann,
+        images_root=args.images_root,
+        output_ann=args.output_ann,
+        output_images_dir=args.output_images_dir,
+        crop_scale=args.crop_scale,
+        min_visible_frac=args.min_visible_frac,
+        min_box_area=args.min_box_area,
+        seed=args.seed,
+        include_original=not args.no_include_original,
+        overwrite=args.overwrite,
+        strict=args.strict,
     )
 
 
