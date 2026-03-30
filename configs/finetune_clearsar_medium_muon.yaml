@@ -1,0 +1,21 @@
+# ClearSAR finetune config for medium/base DINOv2 backbone with runtime augmentation.
+# Usage:
+# python3 scripts/finetune_clearsar.py --config configs/finetune_clearsar_medium_muon.yaml
+
+augment_train_after_split: true
+augmentation_overwrite: true
+
+phase_a_epochs: 100
+phase_b_epochs: 0
+batch_size: 5
+image_size: 224
+num_workers: 1
+print_freq: 10
+
+backbone_name: vit_base_patch14_dinov2
+resume_checkpoint: outputs/clearsar_finetune/phase_a_epoch_049.pth
+num_queries: 100
+num_encoder_layers: 5
+num_decoder_layers: 5
+
+optimizer: muon

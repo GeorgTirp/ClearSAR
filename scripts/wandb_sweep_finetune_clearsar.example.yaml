@@ -1,0 +1,49 @@
+program: scripts/finetune_clearsar.py
+name: clearsar_finetune_time_budgeted_sweep
+method: bayes
+metric:
+  name: val/best_loss
+  goal: minimize
+
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 1.0e-5
+    max: 3.0e-4
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1.0e-5
+    max: 5.0e-3
+  batch_size:
+    values: [4, 5, 6]
+  phase_a_epochs:
+    values: [10, 15, 20]
+  phase_b_epochs:
+    values: [20, 40, 60]
+  backbone_lr_mult:
+    values: [0.05, 0.1, 0.2]
+  dropout:
+    values: [0.05, 0.1, 0.2]
+  grad_clip_norm:
+    values: [0.1, 0.5, 1.0]
+  num_queries:
+    values: [100, 200, 300]
+  muon_lr_mult:
+    values: [10.0, 20.0, 30.0]
+  max_run_minutes:
+    value: 30
+  skip_final_map_eval:
+    value: true
+  optimizer:
+    value: muon
+
+command:
+  - ${env}
+  - python3
+  - ${program}
+  - --config
+  - configs/finetune_clearsar_sweep_base.yaml
+  - --wandb-enable
+  - --wandb-use-sweep-config
+  - --wandb-project
+  - clearsar-finetune

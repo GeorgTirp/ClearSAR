@@ -3,7 +3,9 @@ import argparse
 import json
 import math
 import random
+import shutil
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -35,6 +37,7 @@ PATH_CONFIG_KEYS = {
     "augmentation_output_root",
     "output_dir",
     "resume_checkpoint",
+    "wandb_sweep_config",
 }
 
 
@@ -405,6 +408,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--print-freq", type=int, default=20)
+    parser.add_argument(
+        "--max-run-minutes",
+        type=float,
+        default=None,
+        help=(
+            "Optional wall-clock budget in minutes for a single training run. "
+            "Training stops after the first completed validation pass once this budget is reached."
+        ),
+    )
+    parser.add_argument(
+        "--skip-final-map-eval",
+        action="store_true",
+        help=(
+            "Skip the final COCO-style mAP evaluation after training. "
+            "Useful for W&B sweeps that optimize on early validation loss."
+        ),
+    )
     parser.add_argument("--wandb-enable", action="store_true", help="Enable Weights & Biases logging.")
     parser.add_argument("--wandb-project", type=str, default="clearsar-finetune")
     parser.add_argument("--wandb-entity", type=str, default=None)
@@ -425,6 +445,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--wandb-watch", action="store_true", help="Enable gradient/parameter watching.")
     parser.add_argument("--wandb-log-freq", type=int, default=100)
+    parser.add_argument(
+        "--wandb-sweep-config",
+        type=Path,
+        default=None,
+        help=(
+            "Optional YAML/JSON W&B sweep definition. Used with --wandb-launch-sweep to create a sweep, "
+            "or as a reference path stored in configs."
+        ),
+    )
+    parser.add_argument(
+        "--wandb-sweep-id",
+        type=str,
+        default=None,
+        help="Existing W&B sweep ID to attach a local agent to.",
+    )
+    parser.add_argument(
+        "--wandb-sweep-count",
+        type=int,
+        default=None,
+        help="Number of W&B sweep runs to execute when creating or joining a sweep locally.",
+    )
+    parser.add_argument(
+        "--wandb-launch-sweep",
+        action="store_true",
+        help="Create a W&B sweep from --wandb-sweep-config and execute a local agent.",
+    )
 
     return parser
 
@@ -1318,8 +1364,23 @@ def save_checkpoint(
         "val_loss": val_loss,
         "args": args_dict,
     }
-    torch.save(payload, ckpt_path)
+    atomic_torch_save(payload, ckpt_path, label="training checkpoint")
     return ckpt_path
+
+
+def atomic_torch_save(payload: Dict[str, Any], path: Path, label: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    try:
+        torch.save(payload, tmp_path)
+        tmp_path.replace(path)
+    except Exception as exc:
+        tmp_path.unlink(missing_ok=True)
+        free_bytes = shutil.disk_usage(path.parent).free
+        free_gb = free_bytes / (1024 ** 3)
+        raise RuntimeError(
+            f"Failed to save {label} to {path}. Available space in {path.parent}: {free_gb:.2f} GiB."
+        ) from exc
 
 
 def serialize_args(args: argparse.Namespace) -> Dict[str, object]:
@@ -1392,6 +1453,33 @@ def maybe_init_wandb(args: argparse.Namespace) -> tuple[Any, Dict[str, Any]]:
             keys = ", ".join(sorted(sweep_overrides.keys()))
             print(f"Applied W&B sweep overrides for keys: {keys}")
     return run, sweep_overrides
+
+
+def load_wandb_sweep_file(config_path: Path) -> Dict[str, Any]:
+    if not config_path.exists():
+        raise FileNotFoundError(f"W&B sweep config file not found: {config_path}")
+
+    suffix = config_path.suffix.lower()
+    if suffix == ".json":
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    elif suffix in {".yaml", ".yml"}:
+        try:
+            import yaml
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "YAML W&B sweep config requires PyYAML. Install it with `pip install pyyaml`."
+            ) from exc
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        if payload is None:
+            payload = {}
+    else:
+        raise ValueError(f"Only JSON or YAML W&B sweep configs are supported, got: {config_path}")
+
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"W&B sweep config must be a JSON/YAML object, got: {type(payload).__name__} from {config_path}."
+        )
+    return payload
 
 
 def collect_lr_metrics(optimizer: OptimizerLike) -> Dict[str, float]:
@@ -1474,9 +1562,14 @@ def validate_spectral_args(args: argparse.Namespace) -> Tuple[int, ...]:
     return fuse_indices
 
 
-def main() -> None:
-    args = parse_args()
+def run_training(args: argparse.Namespace) -> None:
     wandb_run, _ = maybe_init_wandb(args)
+    if wandb_run is not None and args.wandb_use_sweep_config:
+        args.output_dir = args.output_dir / wandb_run.id
+        if args.augmentation_output_root is not None:
+            args.augmentation_output_root = args.augmentation_output_root / wandb_run.id
+        print(f"Using per-run sweep output directory: {args.output_dir}")
+
     set_seed(args.seed)
     augmented_filename_markers = parse_augmented_filename_markers(args.augmented_filename_markers)
     args.augmented_filename_markers = augmented_filename_markers
@@ -1603,6 +1696,8 @@ def main() -> None:
         raise ValueError(
             f"--train-val-split-ratio must be in (0, 1), got {args.train_val_split_ratio}."
         )
+    if args.max_run_minutes is not None and args.max_run_minutes <= 0:
+        raise ValueError(f"--max-run-minutes must be > 0 when provided, got {args.max_run_minutes}.")
     if not (0.0 <= args.eval_score_threshold <= 1.0):
         raise ValueError(
             f"--eval-score-threshold must be in [0, 1], got {args.eval_score_threshold}."
@@ -1727,6 +1822,9 @@ def main() -> None:
             print(f"Warning: failed to read existing best checkpoint at {best_path}: {exc}")
 
     global_epoch = 0
+    run_start_time = time.monotonic()
+    stopped_early = False
+    stop_reason: Optional[str] = None
     resume_phase_idx: Optional[int] = None
     resume_epoch_in_phase = 0
     resume_optimizer_state: Optional[Dict[str, Any]] = None
@@ -1910,7 +2008,7 @@ def main() -> None:
 
             if val_loss < best_val:
                 best_val = val_loss
-                torch.save(
+                atomic_torch_save(
                     {
                         "phase": phase_name,
                         "global_epoch": global_epoch,
@@ -1919,6 +2017,7 @@ def main() -> None:
                         "args": args_dict,
                     },
                     best_path,
+                    label="best checkpoint",
                 )
                 print(f"New best checkpoint: {best_path} (val_loss={best_val:.4f})")
                 if wandb_run is not None:
@@ -1933,9 +2032,31 @@ def main() -> None:
                     "train/loss": float(train_loss),
                     "val/loss": float(val_loss),
                     "val/best_loss": float(best_val),
+                    "time/elapsed_minutes": float((time.monotonic() - run_start_time) / 60.0),
                 }
                 metrics.update(collect_lr_metrics(optimizer))
                 wandb_run.log(metrics, step=global_epoch)
+
+            if args.max_run_minutes is not None:
+                elapsed_minutes = (time.monotonic() - run_start_time) / 60.0
+                if elapsed_minutes >= args.max_run_minutes:
+                    stopped_early = True
+                    stop_reason = (
+                        f"Reached --max-run-minutes={args.max_run_minutes:.2f} after validation "
+                        f"at {phase_name} epoch {epoch}/{phase_epochs}."
+                    )
+                    print(stop_reason)
+                    if wandb_run is not None:
+                        wandb_run.summary["stopped_early"] = True
+                        wandb_run.summary["stop_reason"] = stop_reason
+                        wandb_run.summary["elapsed_minutes"] = float(elapsed_minutes)
+                    break
+
+        if stopped_early:
+            break
+
+    if wandb_run is not None and not stopped_early:
+        wandb_run.summary["stopped_early"] = False
 
     best_path = args.output_dir / "best.pth"
     if best_path.exists():
@@ -1944,6 +2065,15 @@ def main() -> None:
         print(f"Loaded best checkpoint for final mAP evaluation: {best_path}")
     else:
         print("Best checkpoint not found. Evaluating final in-memory model state.")
+
+    if args.skip_final_map_eval:
+        print("Skipping final COCO-style evaluation (--skip-final-map-eval).")
+        if wandb_run is not None:
+            wandb_run.summary["final_eval_skipped"] = True
+            if stop_reason is not None:
+                wandb_run.summary["stop_reason"] = stop_reason
+            wandb_run.finish()
+        return
 
     eval_dataset = ClearSARCocoDataset(
         images_root=args.test_images_root,
@@ -1975,6 +2105,7 @@ def main() -> None:
     )
 
     if wandb_run is not None:
+        wandb_run.summary["final_eval_skipped"] = False
         wandb_run.summary[f"{eval_split}_map_50_95"] = float(eval_metrics["map_50_95"])
         wandb_run.summary[f"{eval_split}_ap50"] = float(eval_metrics["ap50"])
         wandb_run.summary[f"{eval_split}_ap75"] = float(eval_metrics["ap75"])
@@ -1983,6 +2114,64 @@ def main() -> None:
 
     if wandb_run is not None:
         wandb_run.finish()
+
+
+def maybe_run_wandb_sweep(args: argparse.Namespace) -> bool:
+    if not args.wandb_launch_sweep and args.wandb_sweep_id is None:
+        return False
+
+    if args.wandb_mode != "online":
+        raise ValueError("W&B sweep execution requires --wandb-mode=online.")
+    if args.wandb_sweep_count is None or args.wandb_sweep_count <= 0:
+        raise ValueError("--wandb-sweep-count must be a positive integer when creating or joining a sweep.")
+
+    try:
+        import wandb  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            "wandb is not installed. Install it with `pip install wandb` "
+            "or add wandb to your project dependencies."
+        ) from exc
+
+    sweep_id = args.wandb_sweep_id
+    if args.wandb_launch_sweep:
+        if args.wandb_sweep_config is None:
+            raise ValueError("--wandb-launch-sweep requires --wandb-sweep-config.")
+        sweep_payload = load_wandb_sweep_file(args.wandb_sweep_config)
+        sweep_id = wandb.sweep(sweep=sweep_payload, project=args.wandb_project, entity=args.wandb_entity)
+        print(f"Created W&B sweep: {sweep_id}")
+
+    if sweep_id is None:
+        raise ValueError("No W&B sweep ID available. Provide --wandb-sweep-id or use --wandb-launch-sweep.")
+
+    print(f"Starting local W&B sweep agent for sweep {sweep_id} with count={args.wandb_sweep_count}.")
+
+    def _agent_entry() -> None:
+        run_args = argparse.Namespace(**vars(args).copy())
+        run_args.resume_checkpoint = None
+        run_args.wandb_enable = True
+        run_args.wandb_use_sweep_config = True
+        run_args.wandb_launch_sweep = False
+        run_args.wandb_sweep_id = None
+        run_args.wandb_sweep_config = None
+        run_args.wandb_sweep_count = None
+        run_training(run_args)
+
+    wandb.agent(
+        sweep_id,
+        function=_agent_entry,
+        count=args.wandb_sweep_count,
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+    )
+    return True
+
+
+def main() -> None:
+    args = parse_args()
+    if maybe_run_wandb_sweep(args):
+        return
+    run_training(args)
 
 
 if __name__ == "__main__":

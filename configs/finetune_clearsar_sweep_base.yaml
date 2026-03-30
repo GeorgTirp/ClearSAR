@@ -1,0 +1,36 @@
+# Base config for W&B hyperparameter sweeps on ClearSAR fine-tuning.
+# Each sweep run gets its own output subdirectory automatically.
+#
+# Local launch:
+# python3 scripts/finetune_clearsar.py \
+#   --config configs/finetune_clearsar_sweep_base.yaml \
+#   --wandb-launch-sweep \
+#   --wandb-sweep-config scripts/wandb_sweep_finetune_clearsar.example.yaml \
+#   --wandb-sweep-count 20
+
+augment_train_after_split: true
+augmentation_overwrite: true
+
+phase_a_epochs: 10
+phase_b_epochs: 40
+batch_size: 5
+image_size: 224
+num_workers: 1
+print_freq: 10
+
+backbone_name: vit_base_patch14_dinov2
+resume_checkpoint: null
+num_queries: 100
+num_encoder_layers: 5
+num_decoder_layers: 5
+optimizer: muon
+
+output_dir: outputs/clearsar_finetune_sweeps
+max_run_minutes: 30.0
+skip_final_map_eval: true
+
+wandb_enable: true
+wandb_project: clearsar-finetune
+wandb_group: finetune_clearsar_sweep
+wandb_job_type: sweep-train
+wandb_use_sweep_config: true

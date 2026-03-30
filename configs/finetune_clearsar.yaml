@@ -97,6 +97,8 @@ eos_coef: 0.1
 seed: 42
 device: cuda
 print_freq: 10
+max_run_minutes: null
+skip_final_map_eval: false
 wandb_enable: false
 wandb_project: clearsar-finetune
 wandb_entity: null
@@ -108,3 +110,7 @@ wandb_mode: online
 wandb_use_sweep_config: false
 wandb_watch: false
 wandb_log_freq: 100
+wandb_sweep_config: null
+wandb_sweep_id: null
+wandb_sweep_count: null
+wandb_launch_sweep: false
